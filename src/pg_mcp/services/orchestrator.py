@@ -30,7 +30,9 @@ from pg_mcp.models.query import (
     ReturnType,
     ValidationResult,
 )
+from pg_mcp.observability.metrics import MetricsCollector
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
+from pg_mcp.resilience.rate_limiter import MultiRateLimiter, RateLimitExceeded
 from pg_mcp.services.result_validator import ResultValidator
 from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
@@ -50,7 +52,7 @@ class QueryOrchestrator:
         >>> orchestrator = QueryOrchestrator(
         ...     sql_generator=generator,
         ...     sql_validator=validator,
-        ...     sql_executor=executor,
+        ...     sql_executors={"mydb": executor},
         ...     result_validator=result_validator,
         ...     schema_cache=cache,
         ...     pools={"mydb": pool},
@@ -67,39 +69,52 @@ class QueryOrchestrator:
         self,
         sql_generator: SQLGenerator,
         sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
+        sql_executors: dict[str, SQLExecutor],
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
         pools: dict[str, Pool],
         resilience_config: ResilienceConfig,
         validation_config: ValidationConfig,
+        circuit_breaker: CircuitBreaker | None = None,
+        rate_limiter: MultiRateLimiter | None = None,
+        metrics: MetricsCollector | None = None,
     ) -> None:
         """Initialize query orchestrator.
 
         Args:
             sql_generator: SQL generation service.
             sql_validator: SQL validation service.
-            sql_executor: SQL execution service.
+            sql_executors: Dictionary mapping database names to SQL execution services.
             result_validator: Result validation service.
             schema_cache: Schema cache instance.
             pools: Dictionary mapping database names to connection pools.
             resilience_config: Resilience configuration for retries and circuit breaker.
             validation_config: Validation configuration including thresholds.
+            circuit_breaker: Optional pre-configured circuit breaker (avoids duplicate instantiation).
+            rate_limiter: Optional rate limiter for query and LLM rate limiting.
+            metrics: Optional metrics collector for instrumentation.
         """
         self.sql_generator = sql_generator
         self.sql_validator = sql_validator
-        self.sql_executor = sql_executor
+        self.sql_executors = sql_executors
         self.result_validator = result_validator
         self.schema_cache = schema_cache
         self.pools = pools
         self.resilience_config = resilience_config
         self.validation_config = validation_config
+        self.metrics = metrics
 
-        # Create circuit breaker for LLM calls
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=resilience_config.circuit_breaker_threshold,
-            recovery_timeout=resilience_config.circuit_breaker_timeout,
-        )
+        # Use provided circuit breaker or create new one
+        if circuit_breaker is not None:
+            self.circuit_breaker = circuit_breaker
+        else:
+            self.circuit_breaker = CircuitBreaker(
+                failure_threshold=resilience_config.circuit_breaker_threshold,
+                recovery_timeout=resilience_config.circuit_breaker_timeout,
+            )
+
+        # Use provided rate limiter or None
+        self.rate_limiter = rate_limiter
 
     async def execute_query(self, request: QueryRequest) -> QueryResponse:
         """Execute complete query flow from question to results.
@@ -128,10 +143,57 @@ class QueryOrchestrator:
         """
         # Generate request_id for full-chain tracing
         request_id = str(uuid.uuid4())
+        start_time = self._get_current_time_ms()
+
+        # Apply rate limiting if configured
+        if self.rate_limiter is not None:
+            try:
+                await self.rate_limiter.acquire_query()
+            except RateLimitExceeded:
+                logger.warning("Query rate limit exceeded", extra={"request_id": request_id})
+                if self.metrics:
+                    self.metrics.sql_rejected.labels(reason="rate_limit").inc()
+                return QueryResponse(
+                    success=False,
+                    generated_sql=None,
+                    validation=None,
+                    data=None,
+                    error=ErrorDetail(
+                        code=ErrorCode.RATE_LIMIT_EXCEEDED.value,
+                        message="Query rate limit exceeded. Please try again later.",
+                        details={},
+                    ),
+                    confidence=0,
+                    tokens_used=None,
+                )
+
         logger.info(
             "Starting query execution",
             extra={"request_id": request_id, "question": request.question[:100]},
         )
+
+        # Record query start metric
+        if self.metrics:
+            self.metrics.query_requests.labels(status="started", database=request.database or "default").inc()
+
+        # Validate question length before processing
+        if len(request.question) > self.validation_config.max_question_length:
+            return QueryResponse(
+                success=False,
+                generated_sql=None,
+                validation=None,
+                data=None,
+                error=ErrorDetail(
+                    code=ErrorCode.VALIDATION_ERROR.value,
+                    message=f"Question exceeds maximum length of {self.validation_config.max_question_length} characters",
+                    details={
+                        "question_length": len(request.question),
+                        "max_allowed": self.validation_config.max_question_length,
+                    },
+                ),
+                confidence=0,
+                tokens_used=None,
+            )
 
         try:
             # Step 1: Resolve database name
@@ -140,6 +202,14 @@ class QueryOrchestrator:
                 "Resolved database",
                 extra={"request_id": request_id, "database": database_name},
             )
+
+            # Get the executor for this database
+            sql_executor = self.sql_executors.get(database_name)
+            if sql_executor is None:
+                raise DatabaseError(
+                    message=f"No SQL executor available for database '{database_name}'",
+                    details={"database": database_name},
+                )
 
             # Step 2: Get schema from cache
             schema = self.schema_cache.get(database_name)
@@ -191,11 +261,11 @@ class QueryOrchestrator:
                     tokens_used=tokens_used,
                 )
 
-            # Step 5: Execute SQL
-            logger.debug("Executing SQL", extra={"request_id": request_id})
+            # Step 5: Execute SQL using the database-specific executor
+            logger.debug("Executing SQL", extra={"request_id": request_id, "database": database_name})
             start_time = self._get_current_time_ms()
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            results, total_count = await sql_executor.execute(generated_sql)
 
             execution_time_ms = self._get_current_time_ms() - start_time
             logger.info(
@@ -224,6 +294,11 @@ class QueryOrchestrator:
                 execution_time_ms=execution_time_ms,
             )
 
+            # Record success metrics
+            if self.metrics:
+                self.metrics.query_requests.labels(status="success", database=database_name).inc()
+                self.metrics.query_duration.observe((self._get_current_time_ms() - start_time) / 1000)
+
             return QueryResponse(
                 success=True,
                 generated_sql=generated_sql,
@@ -244,6 +319,13 @@ class QueryOrchestrator:
                     "error_message": str(e),
                 },
             )
+            # Record failure metrics
+            if self.metrics:
+                db_label = database_name if 'database_name' in dir() else (request.database or "unknown")
+                self.metrics.query_requests.labels(status="error", database=db_label).inc()
+                if e.code == ErrorCode.SECURITY_VIOLATION:
+                    self.metrics.sql_rejected.labels(reason="security").inc()
+
             return QueryResponse(
                 success=False,
                 generated_sql=None,
@@ -263,6 +345,11 @@ class QueryOrchestrator:
                 "Query execution failed with unexpected error",
                 extra={"request_id": request_id},
             )
+            # Record failure metrics
+            if self.metrics:
+                db_label = database_name if 'database_name' in dir() else (request.database or "unknown")
+                self.metrics.query_requests.labels(status="error", database=db_label).inc()
+
             return QueryResponse(
                 success=False,
                 generated_sql=None,
@@ -385,13 +472,30 @@ class QueryOrchestrator:
                     },
                 )
 
-                # Generate SQL
+                # Generate SQL with rate limiting for LLM
+                if self.rate_limiter is not None:
+                    try:
+                        await self.rate_limiter.acquire_llm()
+                    except RateLimitExceeded:
+                        logger.warning("LLM rate limit exceeded", extra={"request_id": request_id})
+                        raise LLMError(
+                            message="LLM rate limit exceeded",
+                            details={},
+                        )
+
+                llm_start = self._get_current_time_ms()
                 generated_sql = await self.sql_generator.generate(
                     question=question,
                     schema=schema,
                     previous_attempt=previous_sql,
                     error_feedback=error_feedback,
                 )
+                llm_duration_ms = self._get_current_time_ms() - llm_start
+
+                # Record LLM metrics
+                if self.metrics:
+                    self.metrics.llm_calls.labels(operation="generate").inc()
+                    self.metrics.llm_latency.labels(operation="generate").observe(llm_duration_ms / 1000)
 
                 # Note: tokens_used would come from OpenAI response metadata if available
                 # For now, we don't extract it, but it can be added later
@@ -531,8 +635,13 @@ class QueryOrchestrator:
                     "request_id": request_id,
                     "confidence": validation_result.confidence,
                     "is_acceptable": validation_result.is_acceptable,
+                    "threshold": self.validation_config.min_confidence_score,
                 },
             )
+
+            # Apply configured confidence threshold
+            if validation_result.confidence < self.validation_config.min_confidence_score:
+                return validation_result.confidence  # Return actual confidence below threshold
 
             return validation_result.confidence
 

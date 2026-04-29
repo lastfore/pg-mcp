@@ -157,21 +157,6 @@ class QueryResponse(BaseModel):
     )
     tokens_used: int | None = Field(None, ge=0, description="LLM tokens used for generation")
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary for MCP tool return.
-
-        Returns:
-            dict: Dictionary representation compatible with MCP protocol.
-        """
-        # Use model_dump but ensure tokens_used is always present
-        result = self.model_dump(exclude_none=False)
-
-        # Ensure tokens_used is always present (use 0 if None)
-        if result.get("tokens_used") is None:
-            result["tokens_used"] = 0
-
-        return result
-
     @field_validator("data")
     @classmethod
     def validate_data(cls, v: QueryResult | None, info: Any) -> QueryResult | None:
@@ -212,9 +197,17 @@ class QueryResponse(BaseModel):
         return v
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary.
+        """Convert response to dictionary for MCP tool return.
 
         Returns:
-            dict: Dictionary representation of query response.
+            dict: Dictionary representation compatible with MCP protocol.
+            Always includes tokens_used (0 if None).
         """
-        return self.model_dump(exclude_none=True)
+        # Use model_dump but ensure tokens_used is always present
+        result = self.model_dump(exclude_none=False)
+
+        # Ensure tokens_used is always present (use 0 if None)
+        if result.get("tokens_used") is None:
+            result["tokens_used"] = 0
+
+        return result

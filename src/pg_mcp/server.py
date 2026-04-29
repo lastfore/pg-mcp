@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
-from pg_mcp.db.pool import close_pools, create_pool
+from pg_mcp.db.pool import close_pools, create_pools
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
@@ -94,17 +94,18 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             },
         )
 
-        # 3. Create database connection pools
+        # 3. Create database connection pools for all configured databases
         logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
+        db_configs = _settings.databases
+        if not db_configs:
+            raise RuntimeError("No databases configured. Please configure at least one database.")
+
+        _pools = await create_pools(db_configs)
         logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
+            f"Created connection pools for {len(_pools)} database(s)",
             extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
+                "databases": list(_pools.keys()),
+                "count": len(_pools),
             },
         )
 
@@ -149,21 +150,24 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
+        # SQL Validator - wire up security configuration
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            blocked_tables=_settings.security.blocked_tables,
+            blocked_columns=list(_settings.security.blocked_columns.keys()),
+            allow_explain=_settings.security.allow_explain,
         )
 
-        # SQL Executor (create one per database)
+        # SQL Executor (create one per database with its specific config)
         sql_executors: dict[str, SQLExecutor] = {}
         for db_name, pool in _pools.items():
+            db_config = _settings.get_database_config(db_name)
+            if db_config is None:
+                raise RuntimeError(f"Database configuration not found for '{db_name}'")
             executor = SQLExecutor(
                 pool=pool,
                 security_config=_settings.security,
-                db_config=_settings.database,
+                db_config=db_config,
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -183,23 +187,26 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             recovery_timeout=_settings.resilience.circuit_breaker_timeout,
         )
 
-        # Rate Limiter
+        # Rate Limiter - use configured limits
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.query_rate_limit,
+            llm_limit=_settings.resilience.llm_rate_limit,
         )
 
-        # 8. Create QueryOrchestrator
+        # 8. Create QueryOrchestrator with per-database executors and rate limiting
         logger.info("Creating query orchestrator...")
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_executors=sql_executors,
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            circuit_breaker=_circuit_breaker,
+            rate_limiter=_rate_limiter,
+            metrics=_metrics,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -355,11 +362,8 @@ async def query(
     # Execute query through orchestrator
     try:
         response: QueryResponse = await _orchestrator.execute_query(request)
-        result = response.to_dict()
-        # Ensure tokens_used is always present
-        if "tokens_used" not in result:
-            result["tokens_used"] = 0
-        return result
+        # to_dict() now always includes tokens_used
+        return response.to_dict()
     except Exception as e:
         logger.exception("Unexpected error in query tool")
         return {

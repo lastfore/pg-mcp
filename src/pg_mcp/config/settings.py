@@ -7,7 +7,7 @@ sensible defaults.
 
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -88,6 +88,17 @@ class SecurityConfig(BaseSettings):
         ],
         description="List of blocked PostgreSQL functions",
     )
+    blocked_tables: list[str] = Field(
+        default_factory=list,
+        description="List of table names to block access to",
+    )
+    blocked_columns: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Dictionary mapping table names to list of blocked column names",
+    )
+    allow_explain: bool = Field(
+        default=False, description="Whether to allow EXPLAIN statements"
+    )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
         default=30.0, ge=1.0, le=300.0, description="Maximum query execution time in seconds"
@@ -105,6 +116,14 @@ class SecurityConfig(BaseSettings):
         """Parse comma-separated string or list."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
+        return v
+
+    @field_validator("blocked_tables", mode="before")
+    @classmethod
+    def parse_blocked_tables(cls, v: str | list[str]) -> list[str]:
+        """Parse comma-separated string or list of blocked tables."""
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
         return v
 
 
@@ -163,6 +182,13 @@ class ResilienceConfig(BaseSettings):
     circuit_breaker_timeout: float = Field(
         default=60.0, ge=10.0, le=300.0, description="Circuit breaker timeout in seconds"
     )
+    # Rate limiting configuration
+    query_rate_limit: int = Field(
+        default=100, ge=1, le=10000, description="Maximum query requests per second"
+    )
+    llm_rate_limit: int = Field(
+        default=10, ge=1, le=1000, description="Maximum LLM calls per second"
+    )
 
 
 class ObservabilityConfig(BaseSettings):
@@ -194,14 +220,54 @@ class Settings(BaseSettings):
         default="development", description="Application environment"
     )
 
-    # Nested configurations
+    # Multi-database support: list of database configurations
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list,
+        description="List of database configurations for multi-database support"
+    )
+
+    # Keep legacy single database config for backward compatibility
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+
+    # Other nested configurations
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    @model_validator(mode="after")
+    def ensure_databases(self) -> "Settings":
+        """Ensure databases list is populated from legacy single config if empty.
+
+        This maintains backward compatibility: if no databases list is provided,
+        the single database config is used as the default.
+        """
+        if not self.databases:
+            # Check if legacy database config has been customized from defaults
+            self.databases = [self.database]
+        return self
+
+    def get_database_config(self, name: str | None = None) -> DatabaseConfig | None:
+        """Get database configuration by name.
+
+        Args:
+            name: Database name to look up. If None, returns the first/default database.
+
+        Returns:
+            DatabaseConfig if found, None otherwise.
+        """
+        if name is None:
+            return self.databases[0] if self.databases else None
+        for db in self.databases:
+            if db.name == name:
+                return db
+        return None
+
+    def get_database_names(self) -> list[str]:
+        """Get list of all configured database names."""
+        return [db.name for db in self.databases]
 
     @property
     def is_production(self) -> bool:

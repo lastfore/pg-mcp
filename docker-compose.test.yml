@@ -1,0 +1,56 @@
+"""Docker Compose configuration for testing PostgreSQL MCP Server.
+
+This provides a reproducible PostgreSQL instance for integration tests.
+"""
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pg-mcp-test-db
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb
+    ports:
+      - "5433:5432"  # Use non-standard port to avoid conflicts
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./tests/fixtures/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pg-mcp-test
+
+  # Optional: Additional test database for multi-db tests
+  postgres_secondary:
+    image: postgres:16-alpine
+    container_name: pg-mcp-test-db2
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: testdb2
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_test_data2:/var/lib/postgresql/data
+      - ./tests/fixtures/schema_secondary.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb2"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pg-mcp-test
+
+volumes:
+  postgres_test_data:
+  postgres_test_data2:
+
+networks:
+  pg-mcp-test:
+    driver: bridge

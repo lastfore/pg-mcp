@@ -2,6 +2,9 @@
 
 This module defines a hierarchy of exceptions for different error scenarios
 and error codes for structured error reporting.
+
+Note: ErrorDetail is defined in query.py as a Pydantic model for proper
+serialization in API responses.
 """
 
 from enum import StrEnum
@@ -17,6 +20,7 @@ class ErrorCode(StrEnum):
     # Client errors (4xx)
     INVALID_REQUEST = "invalid_request"
     VALIDATION_FAILED = "validation_failed"
+    VALIDATION_ERROR = "validation_error"
     SECURITY_VIOLATION = "security_violation"
     SQL_PARSE_ERROR = "sql_parse_error"
     QUESTION_TOO_LONG = "question_too_long"
@@ -36,47 +40,9 @@ class ErrorCode(StrEnum):
     RESOURCE_EXHAUSTED = "resource_exhausted"
 
 
-class ErrorDetail:
-    """Structured error detail information."""
-
-    def __init__(
-        self,
-        code: ErrorCode,
-        message: str,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        """Initialize error detail.
-
-        Args:
-            code: Error code identifier.
-            message: Human-readable error message.
-            details: Optional additional context.
-        """
-        self.code = code
-        self.message = message
-        self.details = details or {}
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary representation.
-
-        Returns:
-            dict: Dictionary containing error information.
-        """
-        result: dict[str, Any] = {
-            "code": self.code,
-            "message": self.message,
-        }
-        if self.details:
-            result["details"] = self.details
-        return result
-
-    def __repr__(self) -> str:
-        """String representation of error detail.
-
-        Returns:
-            str: String representation.
-        """
-        return f"ErrorDetail(code={self.code}, message={self.message!r})"
+# Note: ErrorDetail is defined in query.py as a Pydantic model
+# for proper serialization. Import it from pg_mcp.models.query
+# or pg_mcp.models for use in responses.
 
 
 class PgMcpError(Exception):
@@ -103,13 +69,17 @@ class PgMcpError(Exception):
         self.code = code
         self.details = details or {}
 
-    def to_error_detail(self) -> ErrorDetail:
+    def to_error_detail(self) -> "ErrorDetail":
         """Convert exception to ErrorDetail.
+
+        Note: This method requires importing ErrorDetail from query.py.
 
         Returns:
             ErrorDetail: Structured error detail.
         """
-        return ErrorDetail(code=self.code, message=self.message, details=self.details)
+        # Import here to avoid circular dependency
+        from pg_mcp.models.query import ErrorDetail
+        return ErrorDetail(code=self.code.value, message=self.message, details=self.details)
 
     def __repr__(self) -> str:
         """String representation of error.

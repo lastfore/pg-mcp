@@ -11,6 +11,18 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 
+class RateLimitExceeded(Exception):
+    """Exception raised when rate limit is exceeded."""
+
+    def __init__(self, message: str = "Rate limit exceeded") -> None:
+        """Initialize rate limit exceeded error.
+
+        Args:
+            message: Error message.
+        """
+        super().__init__(message)
+
+
 class RateLimiter:
     """Async rate limiter using semaphore for concurrent request control.
 
@@ -284,6 +296,38 @@ class MultiRateLimiter:
         """
         async with self._llm_limiter(timeout=timeout):
             yield
+
+    async def acquire_query(self, *, timeout: float | None = None) -> None:  # noqa: ASYNC109
+        """Acquire a slot for query operation.
+
+        Args:
+            timeout: Optional timeout in seconds.
+
+        Raises:
+            RateLimitExceeded: If unable to acquire slot within timeout.
+        """
+        try:
+            acquired = await self._query_limiter.acquire(timeout=timeout)
+            if not acquired:
+                raise RateLimitExceeded("Query rate limit exceeded")
+        except asyncio.TimeoutError as e:
+            raise RateLimitExceeded("Query rate limit timeout") from e
+
+    async def acquire_llm(self, *, timeout: float | None = None) -> None:  # noqa: ASYNC109
+        """Acquire a slot for LLM operation.
+
+        Args:
+            timeout: Optional timeout in seconds.
+
+        Raises:
+            RateLimitExceeded: If unable to acquire slot within timeout.
+        """
+        try:
+            acquired = await self._llm_limiter.acquire(timeout=timeout)
+            if not acquired:
+                raise RateLimitExceeded("LLM rate limit exceeded")
+        except asyncio.TimeoutError as e:
+            raise RateLimitExceeded("LLM rate limit timeout") from e
 
     def get_all_stats(self) -> dict[str, dict[str, Any]]:
         """Get statistics for all rate limiters.

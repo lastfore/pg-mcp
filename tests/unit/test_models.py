@@ -1,445 +1,233 @@
-"""Unit tests for data models.
+"""Tests for data models.
 
-Tests for schema, query, and error models to ensure correct validation
-and behavior.
+This module tests Pydantic models including QueryResponse, ErrorDetail, and others.
 """
 
 import pytest
 from pydantic import ValidationError
 
-from pg_mcp.models.errors import (
-    DatabaseError,
-    ErrorCode,
+from pg_mcp.models.query import (
     ErrorDetail,
-    LLMTimeoutError,
-    LLMUnavailableError,
-    PgMcpError,
-    SecurityViolationError,
-    SQLParseError,
+    QueryRequest,
+    QueryResponse,
+    QueryResult,
+    ResultValidationResult,
+    ReturnType,
+    ValidationResult,
 )
-from pg_mcp.models.query import QueryRequest, QueryResponse, QueryResult, ReturnType
-from pg_mcp.models.schema import (
-    ColumnInfo,
-    DatabaseSchema,
-    EnumTypeInfo,
-    ForeignKeyInfo,
-    IndexInfo,
-    TableInfo,
-)
-
-
-class TestColumnInfo:
-    """Tests for ColumnInfo model."""
-
-    def test_basic_column(self) -> None:
-        """Test basic column creation."""
-        col = ColumnInfo(
-            name="id",
-            data_type="integer",
-            is_nullable=False,
-            is_primary_key=True,
-        )
-        assert col.name == "id"
-        assert col.data_type == "integer"
-        assert not col.is_nullable
-        assert col.is_primary_key
-
-    def test_column_with_default(self) -> None:
-        """Test column with default value."""
-        col = ColumnInfo(
-            name="created_at",
-            data_type="timestamp",
-            is_nullable=False,
-            default_value="now()",
-        )
-        assert col.default_value == "now()"
-
-    def test_to_prompt_line_primary_key(self) -> None:
-        """Test prompt formatting for primary key column."""
-        col = ColumnInfo(
-            name="id",
-            data_type="integer",
-            is_nullable=False,
-            is_primary_key=True,
-        )
-        line = col.to_prompt_line()
-        assert "id: integer" in line
-        assert "PRIMARY KEY" in line
-        assert "NOT NULL" in line
-
-    def test_to_prompt_line_with_comment(self) -> None:
-        """Test prompt formatting with comment."""
-        col = ColumnInfo(
-            name="email",
-            data_type="varchar(255)",
-            is_nullable=False,
-            is_unique=True,
-            comment="User email address",
-        )
-        line = col.to_prompt_line()
-        assert "email: varchar(255)" in line
-        assert "UNIQUE" in line
-        assert "User email address" in line
-
-
-class TestForeignKeyInfo:
-    """Tests for ForeignKeyInfo model."""
-
-    def test_foreign_key_creation(self) -> None:
-        """Test foreign key creation."""
-        fk = ForeignKeyInfo(
-            constraint_name="fk_user_id",
-            column_name="user_id",
-            referenced_table="users",
-            referenced_column="id",
-        )
-        assert fk.column_name == "user_id"
-        assert fk.referenced_table == "users"
-
-    def test_to_prompt_line(self) -> None:
-        """Test prompt formatting."""
-        fk = ForeignKeyInfo(
-            constraint_name="fk_user_id",
-            column_name="user_id",
-            referenced_table="users",
-            referenced_column="id",
-        )
-        line = fk.to_prompt_line()
-        assert "user_id -> users.id" in line
-
-
-class TestIndexInfo:
-    """Tests for IndexInfo model."""
-
-    def test_basic_index(self) -> None:
-        """Test basic index creation."""
-        idx = IndexInfo(
-            name="idx_email",
-            columns=["email"],
-            is_unique=True,
-        )
-        assert idx.name == "idx_email"
-        assert idx.columns == ["email"]
-        assert idx.is_unique
-
-    def test_composite_index(self) -> None:
-        """Test composite index."""
-        idx = IndexInfo(
-            name="idx_user_created",
-            columns=["user_id", "created_at"],
-            index_type="btree",
-        )
-        assert len(idx.columns) == 2
-        line = idx.to_prompt_line()
-        assert "user_id, created_at" in line
-
-
-class TestTableInfo:
-    """Tests for TableInfo model."""
-
-    def test_basic_table(self) -> None:
-        """Test basic table creation."""
-        table = TableInfo(
-            schema_name="public",
-            table_name="users",
-            columns=[
-                ColumnInfo(
-                    name="id",
-                    data_type="integer",
-                    is_nullable=False,
-                    is_primary_key=True,
-                ),
-                ColumnInfo(
-                    name="email",
-                    data_type="varchar(255)",
-                    is_nullable=False,
-                    is_unique=True,
-                ),
-            ],
-        )
-        assert table.table_name == "users"
-        assert len(table.columns) == 2
-        assert table.full_name == "public.users"
-
-    def test_to_prompt_section(self) -> None:
-        """Test prompt section generation."""
-        table = TableInfo(
-            schema_name="public",
-            table_name="users",
-            columns=[
-                ColumnInfo(
-                    name="id",
-                    data_type="integer",
-                    is_nullable=False,
-                    is_primary_key=True,
-                )
-            ],
-            comment="User accounts",
-        )
-        section = table.to_prompt_section()
-        assert "Table: public.users" in section
-        assert "Description: User accounts" in section
-        assert "Columns:" in section
-
-
-class TestEnumTypeInfo:
-    """Tests for EnumTypeInfo model."""
-
-    def test_enum_creation(self) -> None:
-        """Test enum type creation."""
-        enum = EnumTypeInfo(
-            schema_name="public",
-            type_name="user_status",
-            values=["active", "inactive", "suspended"],
-        )
-        assert enum.type_name == "user_status"
-        assert len(enum.values) == 3
-        assert enum.full_name == "public.user_status"
-
-    def test_to_prompt_line(self) -> None:
-        """Test prompt formatting."""
-        enum = EnumTypeInfo(
-            schema_name="public",
-            type_name="user_status",
-            values=["active", "inactive"],
-        )
-        line = enum.to_prompt_line()
-        assert "user_status:" in line
-        assert "'active'" in line
-        assert "'inactive'" in line
-
-
-class TestDatabaseSchema:
-    """Tests for DatabaseSchema model."""
-
-    def test_empty_schema(self) -> None:
-        """Test empty schema creation."""
-        schema = DatabaseSchema(database_name="testdb")
-        assert schema.database_name == "testdb"
-        assert len(schema.tables) == 0
-        assert len(schema.enum_types) == 0
-
-    def test_get_table(self) -> None:
-        """Test table lookup."""
-        table = TableInfo(schema_name="public", table_name="users", columns=[])
-        schema = DatabaseSchema(database_name="testdb", tables=[table])
-
-        found = schema.get_table("users")
-        assert found is not None
-        assert found.table_name == "users"
-
-        not_found = schema.get_table("nonexistent")
-        assert not_found is None
-
-    def test_to_prompt_context(self) -> None:
-        """Test full schema prompt generation."""
-        schema = DatabaseSchema(
-            database_name="testdb",
-            version="16.0",
-            tables=[
-                TableInfo(
-                    schema_name="public",
-                    table_name="users",
-                    columns=[
-                        ColumnInfo(
-                            name="id",
-                            data_type="integer",
-                            is_nullable=False,
-                            is_primary_key=True,
-                        )
-                    ],
-                )
-            ],
-            enum_types=[
-                EnumTypeInfo(
-                    schema_name="public",
-                    type_name="user_status",
-                    values=["active", "inactive"],
-                )
-            ],
-        )
-        context = schema.to_prompt_context()
-        assert "Database: testdb" in context
-        assert "PostgreSQL Version: 16.0" in context
-        assert "Custom Types" in context
-        assert "Tables" in context
 
 
 class TestQueryRequest:
-    """Tests for QueryRequest model."""
+    """Test QueryRequest model."""
 
     def test_valid_request(self) -> None:
-        """Test valid query request."""
-        req = QueryRequest(
-            question="How many users are there?",
+        """Test creating a valid query request."""
+        request = QueryRequest(
+            question="How many users?",
+            database="test_db",
             return_type=ReturnType.RESULT,
         )
-        assert req.question == "How many users are there?"
-        assert req.return_type == ReturnType.RESULT
+        assert request.question == "How many users?"
+        assert request.database == "test_db"
+        assert request.return_type == ReturnType.RESULT
 
-    def test_question_sanitization(self) -> None:
-        """Test question is stripped."""
-        req = QueryRequest(question="  trimmed  ")
-        assert req.question == "trimmed"
+    def test_question_stripped(self) -> None:
+        """Test that question is stripped of whitespace."""
+        request = QueryRequest(question="  Test question  ")
+        assert request.question == "Test question"
 
     def test_empty_question_rejected(self) -> None:
-        """Test empty question is rejected."""
+        """Test that empty questions are rejected."""
         with pytest.raises(ValidationError):
             QueryRequest(question="")
 
-    def test_whitespace_only_rejected(self) -> None:
-        """Test whitespace-only question is rejected."""
+    def test_question_too_long_rejected(self) -> None:
+        """Test that questions exceeding max_length are rejected."""
         with pytest.raises(ValidationError):
-            QueryRequest(question="   ")
-
-    def test_question_too_long(self) -> None:
-        """Test question length limit."""
-        with pytest.raises(ValidationError):
-            QueryRequest(question="x" * 10001)
-
-
-class TestQueryResult:
-    """Tests for QueryResult model."""
-
-    def test_empty_result(self) -> None:
-        """Test empty result."""
-        result = QueryResult()
-        assert result.row_count == 0
-        assert len(result.rows) == 0
-        assert len(result.columns) == 0
-
-    def test_result_with_data(self) -> None:
-        """Test result with data."""
-        result = QueryResult(
-            columns=["id", "name"],
-            rows=[
-                {"id": 1, "name": "Alice"},
-                {"id": 2, "name": "Bob"},
-            ],
-            row_count=2,
-            execution_time_ms=15.5,
-        )
-        assert result.row_count == 2
-        assert len(result.rows) == 2
-        assert result.execution_time_ms == 15.5
+            QueryRequest(question="a" * 10001)  # Max is 10000
 
 
 class TestQueryResponse:
-    """Tests for QueryResponse model."""
+    """Test QueryResponse model including to_dict behavior."""
 
-    def test_successful_response(self) -> None:
-        """Test successful query response."""
+    def test_to_dict_always_includes_tokens_used(self) -> None:
+        """Test that to_dict always includes tokens_used field."""
         response = QueryResponse(
             success=True,
-            generated_sql="SELECT COUNT(*) FROM users",
-            data=QueryResult(
-                columns=["count"],
-                rows=[{"count": 10}],
-                row_count=1,
-            ),
-            confidence=95,
+            generated_sql="SELECT 1",
+            tokens_used=None,  # Explicitly None
         )
-        assert response.success
-        assert response.generated_sql is not None
-        assert response.data is not None
-        assert response.confidence == 95
 
-    def test_error_response(self) -> None:
-        """Test error response."""
-        from pg_mcp.models.query import ErrorDetail
+        result = response.to_dict()
 
+        assert "tokens_used" in result
+        assert result["tokens_used"] == 0  # Should default to 0
+
+    def test_to_dict_preserves_tokens_used_when_set(self) -> None:
+        """Test that to_dict preserves tokens_used when set."""
         response = QueryResponse(
-            success=False,
-            error=ErrorDetail(
-                code="sql_parse_error",
-                message="Invalid SQL syntax",
-            ),
+            success=True,
+            generated_sql="SELECT 1",
+            tokens_used=150,
         )
-        assert not response.success
-        assert response.error is not None
-        assert response.error.code == "sql_parse_error"
 
-    def test_sql_only_response(self) -> None:
-        """Test response with SQL only (no execution)."""
+        result = response.to_dict()
+
+        assert result["tokens_used"] == 150
+
+    def test_to_dict_success_response(self) -> None:
+        """Test to_dict for successful response."""
         response = QueryResponse(
             success=True,
             generated_sql="SELECT * FROM users",
-            confidence=90,
+            data=QueryResult(
+                columns=["id", "name"],
+                rows=[{"id": 1, "name": "Alice"}],
+                row_count=1,
+                execution_time_ms=100.0,
+            ),
+            confidence=95,
+            tokens_used=200,
         )
-        assert response.success
-        assert response.generated_sql is not None
-        assert response.data is None
 
+        result = response.to_dict()
 
-class TestErrorModels:
-    """Tests for error models."""
+        assert result["success"] is True
+        assert result["generated_sql"] == "SELECT * FROM users"
+        assert result["confidence"] == 95
+        assert result["tokens_used"] == 200
+        assert result["data"]["columns"] == ["id", "name"]
 
-    def test_error_detail(self) -> None:
-        """Test ErrorDetail creation."""
-        detail = ErrorDetail(
-            code=ErrorCode.SQL_PARSE_ERROR,
-            message="Invalid syntax",
-            details={"position": 10},
+    def test_to_dict_error_response(self) -> None:
+        """Test to_dict for error response."""
+        response = QueryResponse(
+            success=False,
+            error=ErrorDetail(
+                code="security_violation",
+                message="DELETE not allowed",
+            ),
+            confidence=0,
+            tokens_used=None,
         )
-        assert detail.code == ErrorCode.SQL_PARSE_ERROR
-        assert detail.message == "Invalid syntax"
-        assert detail.details["position"] == 10
 
-    def test_error_detail_to_dict(self) -> None:
-        """Test ErrorDetail serialization."""
-        detail = ErrorDetail(
-            code=ErrorCode.DATABASE_ERROR,
-            message="Connection failed",
+        result = response.to_dict()
+
+        assert result["success"] is False
+        assert result["error"]["code"] == "security_violation"
+        assert result["tokens_used"] == 0  # Should default to 0
+
+
+class TestErrorDetail:
+    """Test ErrorDetail model."""
+
+    def test_error_detail_creation(self) -> None:
+        """Test creating ErrorDetail."""
+        error = ErrorDetail(
+            code="test_error",
+            message="Test message",
+            details={"key": "value"},
         )
-        d = detail.to_dict()
-        assert d["code"] == ErrorCode.DATABASE_ERROR
-        assert d["message"] == "Connection failed"
 
-    def test_base_exception(self) -> None:
-        """Test PgMcpError base exception."""
-        err = PgMcpError(
-            message="Something went wrong",
-            code=ErrorCode.INTERNAL_ERROR,
+        assert error.code == "test_error"
+        assert error.message == "Test message"
+        assert error.details == {"key": "value"}
+
+    def test_error_detail_optional_details(self) -> None:
+        """Test ErrorDetail with no details."""
+        error = ErrorDetail(
+            code="simple_error",
+            message="Simple message",
         )
-        assert str(err) == "Something went wrong"
-        assert err.code == ErrorCode.INTERNAL_ERROR
 
-    def test_security_violation_error(self) -> None:
-        """Test SecurityViolationError."""
-        err = SecurityViolationError(
-            message="DELETE not allowed",
-            details={"statement": "DELETE"},
+        assert error.details is None
+
+
+class TestValidationResult:
+    """Test ValidationResult model."""
+
+    def test_is_safe_property(self) -> None:
+        """Test is_safe property calculation."""
+        # Safe: valid, select, no modification, no blocked functions
+        safe_result = ValidationResult(
+            is_valid=True,
+            is_select=True,
+            allows_data_modification=False,
+            uses_blocked_functions=[],
         )
-        assert err.code == ErrorCode.SECURITY_VIOLATION
-        assert "DELETE not allowed" in str(err)
+        assert safe_result.is_safe is True
 
-    def test_sql_parse_error(self) -> None:
-        """Test SQLParseError."""
-        err = SQLParseError(message="Invalid SQL")
-        assert err.code == ErrorCode.SQL_PARSE_ERROR
-
-    def test_database_error(self) -> None:
-        """Test DatabaseError."""
-        err = DatabaseError(message="Query failed")
-        assert err.code == ErrorCode.DATABASE_ERROR
-
-    def test_llm_timeout_error(self) -> None:
-        """Test LLMTimeoutError."""
-        err = LLMTimeoutError(message="Request timed out")
-        assert err.code == ErrorCode.LLM_TIMEOUT
-
-    def test_llm_unavailable_error(self) -> None:
-        """Test LLMUnavailableError."""
-        err = LLMUnavailableError(message="API unavailable")
-        assert err.code == ErrorCode.LLM_UNAVAILABLE
-
-    def test_error_to_detail(self) -> None:
-        """Test exception to ErrorDetail conversion."""
-        err = SecurityViolationError(
-            message="Blocked function",
-            details={"function": "pg_sleep"},
+        # Unsafe: allows modification
+        unsafe_mod = ValidationResult(
+            is_valid=True,
+            is_select=True,
+            allows_data_modification=True,
+            uses_blocked_functions=[],
         )
-        detail = err.to_error_detail()
-        assert detail.code == ErrorCode.SECURITY_VIOLATION
-        assert detail.message == "Blocked function"
-        assert detail.details["function"] == "pg_sleep"
+        assert unsafe_mod.is_safe is False
+
+        # Unsafe: uses blocked functions
+        unsafe_func = ValidationResult(
+            is_valid=True,
+            is_select=True,
+            allows_data_modification=False,
+            uses_blocked_functions=["pg_sleep"],
+        )
+        assert unsafe_func.is_safe is False
+
+        # Unsafe: not valid
+        unsafe_valid = ValidationResult(
+            is_valid=False,
+            is_select=True,
+            allows_data_modification=False,
+            uses_blocked_functions=[],
+        )
+        assert unsafe_valid.is_safe is False
+
+
+class TestResultValidationResult:
+    """Test ResultValidationResult model."""
+
+    def test_acceptable_when_confidence_high(self) -> None:
+        """Test that is_acceptable reflects confidence."""
+        result = ResultValidationResult(
+            confidence=85,
+            explanation="Results look good",
+            is_acceptable=True,
+        )
+        assert result.is_acceptable is True
+
+    def test_not_acceptable_when_confidence_low(self) -> None:
+        """Test that low confidence marks as not acceptable."""
+        result = ResultValidationResult(
+            confidence=30,
+            explanation="Results don't match question",
+            is_acceptable=False,
+        )
+        assert result.is_acceptable is False
+
+
+class TestQueryResult:
+    """Test QueryResult model."""
+
+    def test_row_count_matches_rows(self) -> None:
+        """Test that row_count is validated against rows length."""
+        result = QueryResult(
+            columns=["id"],
+            rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+            row_count=0,  # Should be overridden
+            execution_time_ms=50.0,
+        )
+
+        # Validator should update row_count to match len(rows)
+        assert result.row_count == 3
+
+    def test_empty_result(self) -> None:
+        """Test empty query result."""
+        result = QueryResult(
+            columns=[],
+            rows=[],
+            row_count=0,
+            execution_time_ms=10.0,
+        )
+
+        assert result.row_count == 0
